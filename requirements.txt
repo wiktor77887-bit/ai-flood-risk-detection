@@ -1,0 +1,7 @@
+rasterio
+numpy
+segmentation-models-pytorch
+matplotlib
+torch
+torchvision
+scipy

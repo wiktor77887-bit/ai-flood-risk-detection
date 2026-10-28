@@ -134,7 +134,7 @@ def dodaj_obrysy(mapa):
                     "color": k, "weight": g, "fill": False}, **nieklik).add_to(mapa)
         else:
             folium.GeoJson(f, style_function=lambda _: {
-                "color": "#FF5A36", "weight": 2.5, "fillColor": "#FF5A36", "fillOpacity": 0.25},
+                "color": "#FF5A36", "weight": 2.5, "fill": False},
                 **nieklik).add_to(mapa)
             lat, lon = MIASTA.get(nazwa) or _srodek_miasta(f)
             folium.CircleMarker((lat, lon), radius=5, color="white", weight=2, fill=True,

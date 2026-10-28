@@ -1,0 +1,1 @@
+{"plik_tif": "NMPT_WROCLAW_CALOSC.tif", "crs": "EPSG:2180", "transform": [0.5, 0.0, 359897.25, 0.0, -0.5, 366243.25], "patch_px": 256, "res_m": 0.5, "wysokosc_px": 19200, "szerokosc_px": 18176, "siatka": [75, 71], "p2": 113.2300033569336, "p98": 142.17999267578125, "skala": 65535}

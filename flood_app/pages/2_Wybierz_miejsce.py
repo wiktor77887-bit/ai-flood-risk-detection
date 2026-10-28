@@ -8,7 +8,9 @@ wykrywa budynki modelem U-Net i generuje animacje GIF.
 import gc
 import inspect
 import json
+import re
 import time
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +23,7 @@ from streamlit_folium import st_folium
 
 import flood_engine as fe
 import ui_common as ui
+import kraje_dsm as kd
 import wcs_fetch as wf
 
 ui.styl()
@@ -28,11 +31,22 @@ ui.wymagaj_logowania()
 ui.nawigacja()
 ui.sprzataj()
 wf.cleanup_cache(ui.WCS_CACHE)
+kd.cleanup_cache(ui.WCS_CACHE)
 
 @st.cache_data(show_spinner=False)
 def wczytaj_obrysy():
     """Obrys Polski i granice miast (GUGiK PRG) z dane/obrysy.geojson. Brak pliku = brak warstwy."""
     sciezka = Path(__file__).resolve().parent.parent / "dane" / "obrysy.geojson"
+    try:
+        return json.loads(sciezka.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def wczytaj_obrysy_zagranica():
+    """Granice krajow i 3 najwazniejszych miast kazdego z nich: dane/obrysy_zagranica.geojson."""
+    sciezka = Path(__file__).resolve().parent.parent / "dane" / "obrysy_zagranica.geojson"
     try:
         return json.loads(sciezka.read_text(encoding="utf-8"))
     except Exception:
@@ -74,24 +88,78 @@ def _miasta():
     return dict(sorted(wynik.items(), key=lambda kv: kv[0].translate(_PL).lower()))
 
 
+def _w_pierscieniu(lat, lon, pierscien):
+    """Test punkt-w-wieloboku (ray casting); pierscien = lista [lon, lat]."""
+    w = False
+    j = len(pierscien) - 1
+    for i in range(len(pierscien)):
+        xi, yi, xj, yj = pierscien[i][0], pierscien[i][1], pierscien[j][0], pierscien[j][1]
+        if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / (yj - yi) + xi:
+            w = not w
+        j = i
+    return w
+
+
+def _w_geometrii(lat, lon, g):
+    wielokaty = [g["coordinates"]] if g["type"] == "Polygon" else g["coordinates"]
+    return any(_w_pierscieniu(lat, lon, w[0]) and not any(_w_pierscieniu(lat, lon, d) for d in w[1:])
+               for w in wielokaty)
+
+
+def miasto_punktu(kraj, lat, lon):
+    """Nazwa zaznaczonego na mapie miasta (z obrysem), w ktorym lezy punkt, albo None."""
+    dane = wczytaj_obrysy() if kraj == "PL" else wczytaj_obrysy_zagranica()
+    for f in (dane or {}).get("features", []):
+        p = f["properties"]
+        if p.get("typ") == "miasto" and (kraj == "PL" or p.get("kod") == kraj) \
+                and _w_geometrii(lat, lon, f["geometry"]):
+            return p["nazwa"]
+    return None
+
+
+def nazwa_pliku_gifa(kraj, lat, lon):
+    """kraj_miasto.gif, a poza zaznaczonym miastem kraj_miasto (dosłownie)."""
+    def czysc(t):
+        t = unicodedata.normalize("NFKD", t.translate(_PL).replace("ł", "l").replace("Ł", "L"))
+        return re.sub(r"[^A-Za-z0-9]+", "-", "".join(c for c in t if not unicodedata.combining(c))).strip("-")
+    return f"{czysc(NAZWY_KRAJOW[kraj])}_{czysc(miasto_punktu(kraj, lat, lon) or 'miasto')}.gif"
+
+
 MIASTA = _miasta()
 ESRI = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 
 st.session_state.setdefault("punkt", None)
 st.session_state.setdefault("map_center", [52.0, 19.3])
 st.session_state.setdefault("map_zoom", 6)
+st.session_state.setdefault("kraj_sel", "PL")
+
+NAZWY_KRAJOW = {"PL": "Polska", **{k: kd.KRAJE[k]["nazwa"] for k in kd.kraje_zagraniczne()}}
+SRODKI_KRAJOW = {"PL": ([52.0, 19.3], 6), "NL": ([52.1, 5.3], 7), "CH": ([46.8, 8.2], 8), "GB": ([52.9, -1.5], 6)}
+
+
+def miasta_kraju(kraj):
+    return MIASTA if kraj == "PL" else kd.KRAJE[kraj]["miasta"]
 
 
 def skocz():
     nazwa = st.session_state.get("miasto_sel")
-    if nazwa in MIASTA:
-        st.session_state["map_center"] = list(MIASTA[nazwa])
+    miasta = miasta_kraju(st.session_state.get("kraj_sel", "PL"))
+    if nazwa in miasta:
+        st.session_state["map_center"] = list(miasta[nazwa])
         st.session_state["map_zoom"] = 14
 
 
+def zmien_kraj():
+    srodek, zoom = SRODKI_KRAJOW[st.session_state["kraj_sel"]]
+    st.session_state["map_center"], st.session_state["map_zoom"] = list(srodek), zoom
+    st.session_state["punkt"] = None
+    st.session_state["miasto_sel"] = "—"
+    st.session_state.pop("wynik_miejsce", None)
+
+
 ui.naglowek("📍", "Symulacja dla miejsca",
-            "Przybliż mapę do rzeki i kliknij miejsce nad brzegiem. Pobierzemy dane wysokościowe (NMPT) z geoportalu "
-            "dla niewielkiego kwadratu wokół punktu i przygotujemy animację zalewania.")
+            "Wybierz kraj, przybliż mapę do rzeki i kliknij miejsce nad brzegiem. Pobierzemy dane wysokościowe (NMPT) "
+            "z geoportalu dla niewielkiego kwadratu wokół punktu i przygotujemy animację zalewania.")
 KROKI = ["Miejsce", "Scenariusz", "Wynik"]
 pasek_krokow = st.empty()
 pasek_krokow.markdown(ui.postep(KROKI, 1 if st.session_state["punkt"] else 0), unsafe_allow_html=True)
@@ -100,7 +168,9 @@ ui.krok(1, "Wybierz miejsce", "Kliknij na mapie punkt przy rzece. Obszar jest ma
 panel, kol_mapa = st.columns([1.35, 3], gap="large")
 with panel:
     with ui.karta("miejsce"):
-        st.selectbox("Przejdź do miasta", ["—"] + list(MIASTA), key="miasto_sel", on_change=skocz)
+        kraj = st.selectbox("Kraj", list(NAZWY_KRAJOW), key="kraj_sel", format_func=NAZWY_KRAJOW.get,
+                            on_change=zmien_kraj)
+        st.selectbox("Przejdź do miasta", ["—"] + list(miasta_kraju(kraj)), key="miasto_sel", on_change=skocz)
         rozmiar = st.radio("Rozmiar obszaru", [256, 384, 512], index=1, horizontal=True,
                            format_func=lambda m: f"{m} m",
                            help="Większy obszar = więcej kafelków danych do pobrania, więc dłuższe czekanie.")
@@ -121,14 +191,19 @@ m = folium.Map(location=st.session_state["map_center"], zoom_start=st.session_st
 LEWO = {"Bydgoszcz", "Gdynia"}      # podpis po lewej stronie kropki, zeby nie zaslaniac sasiada (Torun, Gdansk)
 
 
-def dodaj_obrysy(mapa):
-    dane = wczytaj_obrysy()
+def dodaj_obrysy(mapa, kraj="PL"):
+    if kraj == "PL":
+        dane = wczytaj_obrysy()
+    else:
+        dane = wczytaj_obrysy_zagranica()
+        if dane:
+            dane = {"features": [f for f in dane["features"] if f["properties"].get("kod") == kraj]}
     if not dane:
         return
     nieklik = {"interactive": False}          # klik w obrys nie moze blokowac wyboru punktu
     for f in dane["features"]:
         nazwa, typ = f["properties"]["nazwa"], f["properties"]["typ"]
-        if typ == "polska":
+        if typ in ("polska", "kraj"):
             for kolor, grub in (("#0F2A3D", 6), ("#FFFFFF", 3)):
                 folium.GeoJson(f, style_function=lambda _, k=kolor, g=grub: {
                     "color": k, "weight": g, "fill": False}, **nieklik).add_to(mapa)
@@ -136,7 +211,7 @@ def dodaj_obrysy(mapa):
             folium.GeoJson(f, style_function=lambda _: {
                 "color": "#FF5A36", "weight": 2.5, "fill": False},
                 **nieklik).add_to(mapa)
-            lat, lon = MIASTA.get(nazwa) or _srodek_miasta(f)
+            lat, lon = (MIASTA.get(nazwa) if kraj == "PL" else None) or _srodek_miasta(f)
             folium.CircleMarker((lat, lon), radius=5, color="white", weight=2, fill=True,
                                 fill_color="#FF5A36", fill_opacity=1, **nieklik).add_to(mapa)
             ranga = f["properties"].get("ranga", 1)
@@ -162,12 +237,16 @@ def dodaj_obrysy(mapa):
         "mp.on('zoomend',u);mp.on('layeradd',u);u();});" % mapa.get_name()))
 
 
-dodaj_obrysy(m)
+dodaj_obrysy(m, kraj)
 fg = folium.FeatureGroup(name="wybor")
 if punkt:
-    e0, n1, side = wf.crop_geometry(punkt[0], punkt[1], n_tiles)
-    rog = [wf.pl1992_to_latlon(e0, n1), wf.pl1992_to_latlon(e0 + side, n1),
-           wf.pl1992_to_latlon(e0 + side, n1 - side), wf.pl1992_to_latlon(e0, n1 - side)]
+    if kraj == "PL":
+        e0, n1, side = wf.crop_geometry(punkt[0], punkt[1], n_tiles)
+        rog = [wf.pl1992_to_latlon(e0, n1), wf.pl1992_to_latlon(e0 + side, n1),
+               wf.pl1992_to_latlon(e0 + side, n1 - side), wf.pl1992_to_latlon(e0, n1 - side)]
+    else:
+        e0, n1, side = kd.crop_geometry(kraj, punkt[0], punkt[1], n_tiles)
+        rog = kd.rogi_latlon(kraj, e0, n1, side)
     folium.Polygon(rog, color=ui.ALERT, weight=3, fill=True, fill_opacity=0.12).add_to(fg)
     folium.CircleMarker(punkt, radius=4, color="white", fill=True, fill_color=ui.ALERT,
                         fill_opacity=1).add_to(fg)
@@ -193,8 +272,12 @@ klik = wyjscie_mapy.get("last_clicked")
 if klik:
     nowy = (round(klik["lat"], 6), round(klik["lng"], 6))
     if nowy != punkt:
-        st.session_state["punkt"] = nowy
-        st.rerun()
+        if kraj != "PL" and not kd.w_zasiegu(kraj, *nowy):
+            st.warning(f"Kliknięty punkt leży poza zasięgiem danych dla kraju: {NAZWY_KRAJOW[kraj]}. "
+                       "Wybierz miejsce w tym kraju albo zmień kraj.")
+        else:
+            st.session_state["punkt"] = nowy
+            st.rerun()
 
 if not punkt:
     st.stop()                       # podpowiedz jest w panelu obok mapy
@@ -204,12 +287,17 @@ ui.krok(2, "Scenariusz wzrostu wody", "O ile metrów podnosimy poziom względem 
 with ui.karta("scenariusz"):
     max_eff, krok = ui.kontrolki_scenariusza()
 
-    uzyj_nmt = st.checkbox(
-        "Użyj oficjalnego modelu terenu (NMT) z geoportalu",
-        value=False,
-        help="Dokładniejszy grunt (bez budynków i drzew), ale pobieranie trwa mniej więcej dwa razy dłużej. "
-             "Bez tego grunt jest szacowany z NMPT - zwykle wystarcza, ale bywa mniej dokładny w gęstych "
-             "zadrzewieniach i przy dużych budynkach.")
+    if kraj == "PL":
+        uzyj_nmt = st.checkbox(
+            "Użyj oficjalnego modelu terenu (NMT) z geoportalu",
+            value=False,
+            help="Dokładniejszy grunt (bez budynków i drzew), ale pobieranie trwa mniej więcej dwa razy dłużej. "
+                 "Bez tego grunt jest szacowany z NMPT - zwykle wystarcza, ale bywa mniej dokładny w gęstych "
+                 "zadrzewieniach i przy dużych budynkach.")
+    else:
+        uzyj_nmt = False
+        if kd.KRAJE[kraj]["uwaga"]:
+            st.info(kd.KRAJE[kraj]["uwaga"])
 
 if not ui.model_dostepny():
     st.error("Brak pliku best_model.pth na serwerze, więc nie da się wykryć budynków.")
@@ -218,11 +306,11 @@ if not ui.model_dostepny():
 st.caption(f"Pobieranie danych z geoportalu trwa zwykle od kilkudziesięciu sekund do kilku minut "
            f"(zapytań naraz: {ui.WCS_WORKERS}){', podwójnie przy NMT' if uzyj_nmt else ''}; "
            "potem generowanie animacji. Nie zamykaj karty. "
-           "Dane NMPT: GUGiK (geoportal.gov.pl).")
+           f"Dane NMPT: {kd.KRAJE[kraj]['zrodlo']}.")
 
 ui.krok(3, "Generuj animację")
 # ---- generowanie ----
-sig_biezacy = (punkt, n_tiles, max_eff, krok, uzyj_nmt)
+sig_biezacy = (kraj, punkt, n_tiles, max_eff, krok, uzyj_nmt)
 
 if st.button("Generuj GIF", type="primary"):
     sem, blad = ui.zarezerwuj(rozmiar / 1000, True)
@@ -233,10 +321,14 @@ if st.button("Generuj GIF", type="primary"):
         pasek = st.progress(0.0, text="Start…")
         try:
             czesc = 0.20 if uzyj_nmt else 0.40
-            teren, info = wf.fetch_crop(
-                punkt[0], punkt[1], n_tiles, ui.WCS_CACHE, workers=ui.WCS_WORKERS,
-                progress=lambda i, n: pasek.progress(
-                    czesc * i / n, text=f"Pobieram NMPT z geoportalu {i}/{n}"))
+            postep_pobierania = lambda i, n: pasek.progress(
+                czesc * i / n, text=f"Pobieram NMPT z geoportalu {i}/{n}")
+            if kraj == "PL":
+                teren, info = wf.fetch_crop(punkt[0], punkt[1], n_tiles, ui.WCS_CACHE,
+                                            workers=ui.WCS_WORKERS, progress=postep_pobierania)
+            else:
+                teren, info = kd.fetch_crop(kraj, punkt[0], punkt[1], n_tiles, ui.WCS_CACHE,
+                                            workers=ui.WCS_WORKERS, progress=postep_pobierania)
             grunt, uwagi = None, []
             if uzyj_nmt:
                 try:
@@ -264,7 +356,8 @@ if st.button("Generuj GIF", type="primary"):
             wynik["from_cache"] = info["from_cache"]
             wynik["tiles"] = info["tiles"]
             st.session_state["wynik_miejsce"] = {"path": str(wyjscie), "info": wynik,
-                                                 "t": time.time() - t0, "sig": sig_biezacy}
+                                                 "t": time.time() - t0, "sig": sig_biezacy,
+                                                 "nazwa": nazwa_pliku_gifa(kraj, *punkt)}
             pasek.empty()
         except Exception as exc:
             pasek.empty()
@@ -277,6 +370,6 @@ w = st.session_state.get("wynik_miejsce")
 if w and w["sig"] == sig_biezacy:
     pasek_krokow.markdown(ui.postep(KROKI, 3), unsafe_allow_html=True)
 ui.pokaz_wynik(
-    w, sig_biezacy, nazwa_pliku="symulacja_powodzi_miejsce.gif",
+    w, sig_biezacy, nazwa_pliku=(w or {}).get("nazwa", "symulacja_powodzi_miejsce.gif"),
     dodatek=(f"Kafelki danych z pamięci podręcznej: {w['info']['from_cache']}/{w['info']['tiles']}."
              if w and w["sig"] == sig_biezacy else ""))

@@ -62,8 +62,7 @@ st.markdown(
     }}
 
     .city-card {{
-        background: {MIST}; border-radius: 14px; padding: 1.1rem 1.3rem;
-        border-left: 5px solid {WATER}; margin-bottom: .9rem;
+        background: transparent; padding: .1rem .2rem .5rem .2rem; margin: 0;
     }}
     .city-card h3 {{ margin: 0 0 .25rem 0; font-size: 1.15rem; }}
     .city-card p  {{ margin: 0; color: {MUTED}; font-size: .93rem; line-height: 1.45; }}
@@ -191,12 +190,191 @@ def _run_segmentation(plik_npy: str, idx: int, mt: float):
 
 
 @st.cache_data(show_spinner=False)
+def _uklad_siatki(sciezka: str, mt: float):
+    """Z pliku pozycji: {(kolumna, wiersz): numer wycinka} i odwrotnie {numer: (kolumna, wiersz)}.
+    Kolumny rosną na wschód, wiersze na południe. Które pole "siatka" jest kolumną, a które
+    wierszem, wykrywamy z położenia narożników ("rogi"), więc nie zależy to od kolejności zapisu."""
+    poz = _wczytaj_json(sciezka, mt)
+    # pozycje_patchy.py zapisuje numer (wiersz, kolumna) każdego wycinka w "rzad_kolumna";
+    # "siatka" to tam tylko rozmiar siatki [wiersze, kolumny] (starsze pliki: lista par w "siatka").
+    siatka, rogi = poz.get("rzad_kolumna"), poz.get("rogi")
+    if not siatka:
+        siatka = poz.get("siatka")
+    if (not siatka or not rogi or len(siatka) != len(rogi)
+            or not isinstance(siatka[0], (list, tuple))):
+        return None
+    pos = {tuple(s): i for i, s in enumerate(siatka) if rogi[i]}
+    kroki = {0: [], 1: []}
+    for (a, b), i in pos.items():
+        for ax, sas in ((0, (a + 1, b)), (1, (a, b + 1))):
+            j = pos.get(sas)
+            if j is not None:
+                kroki[ax].append((rogi[j][0][0] - rogi[i][0][0], rogi[j][0][1] - rogi[i][0][1]))
+    if not kroki[0] or not kroki[1]:
+        return None
+    m = {ax: np.median(np.array(v), axis=0) for ax, v in kroki.items()}
+    kol_ax, wier_ax = (0, 1) if abs(m[0][0]) >= abs(m[1][0]) else (1, 0)
+    sx = 1 if m[kol_ax][0] >= 0 else -1      # kolumny: rosnąca długość geogr. = wschód
+    sy = 1 if m[wier_ax][1] < 0 else -1      # wiersze: malejąca szerokość geogr. = południe
+    uklad, odwr = {}, {}
+    for v, i in pos.items():
+        kw = (sx * v[kol_ax], sy * v[wier_ax])
+        uklad[kw] = i
+        odwr[i] = kw
+    return uklad, odwr
+
+
+def indeksy_bloku(pozycje_plik: str, idx: int, k: int):
+    """Numery wycinków bloku k x k, w którym leży wycinek idx (wiersz po wierszu, od północnego
+    zachodu). Bloki tworzą stałą siatkę (nie nakładają się): wiersz i kolumna dzielone przez k.
+    None na liście = brak wycinka w tym miejscu."""
+    u = _uklad_siatki(pozycje_plik, os.path.getmtime(pozycje_plik))
+    if not u or idx not in u[1]:
+        return None
+    uklad, odwr = u
+    c, r = odwr[idx]
+    c0, r0 = (c // k) * k, (r // k) * k
+    return tuple(uklad.get((c0 + dx, r0 + dy)) for dy in range(k) for dx in range(k))
+
+
+OPCJE_BLOKU = {"Mały (2 × 2)": 2, "Duży (4 × 4)": 4}
+
+
+def wybor_bloku(miasto: str, klucz: str, opis: str) -> int:
+    """Radio z rozmiarem bloku. Wartość pamiętana osobno (session_state), więc ta sama w widokach
+    „Położenie” i „Detekcja budynków” (Streamlit kasuje stan widgetu, którego nie narysowano)."""
+    skl = f"k_{miasto}"
+    wartosci = list(OPCJE_BLOKU.values())
+    biezace = st.session_state.get(skl, 2)
+    if biezace not in wartosci:
+        biezace = 2
+    wyb = st.radio(opis, list(OPCJE_BLOKU), index=wartosci.index(biezace),
+                   horizontal=True, key=f"{klucz}_{miasto}")
+    st.session_state[skl] = OPCJE_BLOKU[wyb]
+    return OPCJE_BLOKU[wyb]
+
+
+def sciezki_rastra(plik_npy: str):
+    """(raster .npy, meta .json) zapisane przez raster_pelny.py obok patches_<miasto>_nmt.npy."""
+    baza = os.path.splitext(plik_npy)[0].rsplit("_", 1)[0]
+    return baza + "_raster.npy", baza + "_raster.json"
+
+
+def raster_pelny_ok(plik_npy: str, pozycje) -> bool:
+    """Czy jest pełny raster (bez luk) zgodny z plikiem pozycji (ta sama siatka kafelków)."""
+    npy_r, json_r = sciezki_rastra(plik_npy)
+    if not (os.path.exists(npy_r) and os.path.exists(json_r) and pozycje):
+        return False
+    meta = _wczytaj_json(json_r, os.path.getmtime(json_r))
+    return list(meta.get("siatka", [])) == list(pozycje.get("siatka", [None]))
+
+
+def _segmentuj(norm: np.ndarray) -> np.ndarray:
+    """U-Net na znormalizowanym obrazie 0..1 (z paddingiem do wielokrotności 32)."""
+    model, device = load_unet_model()
+    H, W = norm.shape
+    pad_h = (32 - (H % 32)) % 32
+    pad_w = (32 - (W % 32)) % 32
+    t = torch.tensor(norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    t = F.pad(t, (0, pad_w, 0, pad_h), mode="reflect").to(device)
+    with torch.no_grad():
+        prob = torch.sigmoid(model(t)).squeeze().cpu().numpy()
+    return (prob[:H, :W] > 0.5).astype(np.uint8)
+
+
+def run_segmentation_raster(plik_npy: str, idx: int, k: int, pozycje_plik: str):
+    """Blok k x k (stała siatka) z pełnego rastra, bez luk; blok zawiera wycinek idx."""
+    u = _uklad_siatki(pozycje_plik, os.path.getmtime(pozycje_plik))
+    c, r = u[1][idx]
+    npy_r, _ = sciezki_rastra(plik_npy)
+    return _run_segmentation_raster(npy_r, (r // k) * k, (c // k) * k, k, mtime(npy_r))
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def _run_segmentation_raster(plik_raster: str, r0: int, c0: int, k: int, mt: float):
+    arr = np.load(plik_raster, mmap_mode="r")        # (H, W) uint16, wartość / 65535 = norma 0..1
+    P = 256
+    y0, x0 = r0 * P, c0 * P
+    y1, x1 = min(y0 + k * P, arr.shape[0]), min(x0 + k * P, arr.shape[1])
+    data = np.full((k * P, k * P), np.nan, dtype=np.float32)   # NaN tylko za brzegiem rastra
+    data[:y1 - y0, :x1 - x0] = np.asarray(arr[y0:y1, x0:x1], dtype=np.float32) / 65535.0
+    brak = np.isnan(data)
+    norm = np.where(brak, 0.0, data).astype(np.float32)
+    mask = _segmentuj(norm)
+    mask[brak] = 0
+    return data, mask
+
+
+def run_segmentation_blok(plik_npy: str, indeksy: tuple, k: int):
+    return _run_segmentation_blok(plik_npy, indeksy, k, mtime(plik_npy))
+
+
+@st.cache_data(show_spinner=False)
+def _run_segmentation_blok(plik_npy: str, indeksy: tuple, k: int, mt: float):
+    """Skleja k x k sąsiednich wycinków w jeden obraz i robi na nim segmentację.
+    Zwraca (dane z NaN w miejscach bez wycinka, maska)."""
+    arr = np.load(plik_npy, mmap_mode="r")
+    P = arr.shape[-1]
+    data = np.full((k * P, k * P), np.nan, dtype=np.float32)
+    for n_, j in enumerate(indeksy):
+        if j is None:
+            continue
+        dy, dx = divmod(n_, k)
+        data[dy * P:(dy + 1) * P, dx * P:(dx + 1) * P] = np.squeeze(np.array(arr[j], dtype=np.float32))
+    brak = np.isnan(data)
+    wart = data[~brak]
+    if wart.size == 0:
+        raise ValueError("Wszystkie wycinki bloku są puste.")
+    if wart.max() > 1.0 or wart.min() < 0.0:
+        p2, p98 = np.percentile(wart, (2, 98))        # wspólna normalizacja całego bloku (bez szwów)
+        norm = np.clip((data - p2) / (p98 - p2 + 1e-6), 0, 1)
+    else:
+        norm = data.copy()
+    norm[brak] = 0.0
+
+    model, device = load_unet_model()
+    H, W = norm.shape
+    pad_h = (32 - (H % 32)) % 32
+    pad_w = (32 - (W % 32)) % 32
+    t = torch.tensor(norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    t = F.pad(t, (0, pad_w, 0, pad_h), mode="reflect").to(device)
+    with torch.no_grad():
+        prob = torch.sigmoid(model(t)).squeeze().cpu().numpy()
+    mask = (prob[:H, :W] > 0.5).astype(np.uint8)
+    mask[brak] = 0
+    return data, mask
+
+
+@st.cache_data(show_spinner=False)
 def load_poland_geojson():
     url = "https://raw.githubusercontent.com/johan/world.geo.json/master/countries/POL.geo.json"
     try:
         return requests.get(url, timeout=5).json()
     except Exception:
         return None
+
+
+@st.cache_data(show_spinner=False)
+def load_poland_outline():
+    """Dokladny obrys Polski (GUGiK PRG) z dane/obrysy.geojson; gdy go brak - prostszy z internetu."""
+    sciezka = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dane", "obrysy.geojson")
+    try:
+        with open(sciezka, encoding="utf-8") as f:
+            for feat in json.load(f)["features"]:
+                if feat["properties"].get("typ") == "polska":
+                    return feat
+    except Exception:
+        pass
+    return load_poland_geojson()
+
+
+def _pierscienie(geo):
+    """Zewnetrzne pierscienie obrysu jako listy [lat, lon] (do maski wokol Polski)."""
+    g = geo.get("geometry", geo) if isinstance(geo, dict) else geo
+    if g.get("type") == "FeatureCollection":
+        g = g["features"][0]["geometry"]
+    polys = [g["coordinates"]] if g["type"] == "Polygon" else g["coordinates"]
+    return [[[c[1], c[0]] for c in p[0]] for p in polys]
 
 
 # ==========================================
@@ -285,10 +463,12 @@ PULSE_CSS = f"""
 @media (prefers-reduced-motion: reduce) {{ .pin::after {{ animation: none; }} }}
 .leaflet-container {{ background: {PAPER}; }}
 .leaflet-tooltip.city-tip {{
-    font-family: 'Manrope', sans-serif; font-weight: 700; font-size: 14px;
+    font-family: 'Manrope', sans-serif; font-weight: 800; font-size: 14px;
     color: {INK}; border: none; border-radius: 8px;
-    padding: 5px 10px; box-shadow: 0 2px 8px rgba(0,0,0,.2);
+    padding: 4px 10px; box-shadow: 0 2px 8px rgba(0,0,0,.22);
 }}
+.leaflet-tooltip-right.city-tip::before {{ border-right-color: white; }}
+.leaflet-tooltip-left.city-tip::before {{ border-left-color: white; }}
 </style>
 """
 
@@ -299,6 +479,7 @@ def zbuduj_mape_polski():
         zoom_start=6,
         tiles=None,
         zoom_control=False,
+        zoom_snap=0.1,
         scrollWheelZoom=False,
         dragging=False,
         doubleClickZoom=False,
@@ -309,27 +490,34 @@ def zbuduj_mape_polski():
     )
     m.get_root().html.add_child(folium.Element(PULSE_CSS))
 
-    geo = load_poland_geojson()
+    geo = load_poland_outline()
     if geo:
-        folium.GeoJson(
-            geo,
-            style_function=lambda _: {
-                "fillColor": WATER, "color": INK,
-                "weight": 1.6, "fillOpacity": 0.22,
-            },
-        ).add_to(m)
+        nieklik = {"interactive": False}
+        # przygaszenie wszystkiego poza Polską: duży prostokąt z "dziurą" w kształcie kraju
+        swiat = [[-85, -180], [-85, 180], [85, 180], [85, -180]]
+        try:
+            folium.Polygon(locations=[swiat] + _pierscienie(geo), color=PAPER, weight=0, fill=True,
+                           fill_color=PAPER, fill_opacity=0.82, **nieklik).add_to(m)
+        except Exception:
+            pass
+        # granica: ciemna obwódka + biała linia, jak na stronie "Symulacja dla miejsca"
+        for kolor, grub in ((INK, 5), ("#FFFFFF", 2.5)):
+            folium.GeoJson(geo, style_function=lambda _, k=kolor, g=grub: {
+                "color": k, "weight": g, "fill": False}, **nieklik).add_to(m)
 
     for nazwa, d in MIASTA.items():
         folium.Marker(
             location=[d["lat"], d["lon"]],
-            tooltip=folium.Tooltip(nazwa, direction="top", offset=(0, -10),
-                                   permanent=False, class_name="city-tip"),
+            tooltip=folium.Tooltip(nazwa, direction="left" if nazwa == "Warszawa" else "right",
+                                   offset=(-12 if nazwa == "Warszawa" else 12, 0),
+                                   permanent=True, class_name="city-tip"),
             icon=folium.DivIcon(
                 html='<div class="pin"></div>',
                 icon_size=(18, 18), icon_anchor=(9, 9),
             ),
         ).add_to(m)
 
+    m.fit_bounds([[49.0, 14.1], [54.85, 24.15]], padding=(10, 10))
     return m
 
 
@@ -370,19 +558,68 @@ def wczytaj_pozycje(plik_npy: str):
     return _wczytaj_json(sciezka, os.path.getmtime(sciezka))
 
 
-def mapa_siatki(pozycje, wybrany):
-    """Satelitarna mapa z kwadratami = wycinki 256x256 w ich prawdziwym położeniu."""
-    features, lons, lats = [], [], []
-    for i, rogi in enumerate(pozycje["rogi"]):
-        if not rogi:
+def _bloki_geojson(pozycje, odwr, k, pelne=False):
+    """Obrysy bloków k x k (stała siatka) w prawdziwym położeniu. Narożniki liczone z kroku siatki
+    jednego wycinka, więc działają też tam, gdzie część wycinków bloku nie istnieje."""
+    rogi = pozycje["rogi"]
+    ref = {}
+    for i, (c, r) in odwr.items():
+        if not rogi[i]:
             continue
-        lons += [p[0] for p in rogi]
-        lats += [p[1] for p in rogi]
+        bk = (c // k, r // k)
+        odl = (c - bk[0] * k) + (r - bk[1] * k)
+        if bk not in ref or odl < ref[bk][0]:
+            ref[bk] = (odl, i)
+    ile = {}
+    for i, (c, r) in odwr.items():
+        if rogi[i]:
+            ile[(c // k, r // k)] = ile.get((c // k, r // k), 0) + 1
+    features = []
+    for bk, (_, i) in ref.items():
+        c, r = odwr[i]
+        nw, ne, _se, sw = (np.array(x) for x in rogi[i][:4])
+        dcol, drow = ne - nw, sw - nw
+        nw_b = nw - (c - bk[0] * k) * dcol - (r - bk[1] * k) * drow
+        pts = [nw_b, nw_b + k * dcol, nw_b + k * dcol + k * drow, nw_b + k * drow]
+        ring = [[float(x), float(y)] for x, y in pts]
         features.append({
             "type": "Feature",
-            "properties": {"idx": i},
-            "geometry": {"type": "Polygon", "coordinates": [rogi + [rogi[0]]]},
+            "properties": {"idx": i, "bk": list(bk), "n": ile[bk], "pelny": pelne or ile[bk] == k * k,
+                           "opis": (f"{k * 256 * pozycje.get('res_m', 0.5):.0f} × "
+                                    f"{k * 256 * pozycje.get('res_m', 0.5):.0f} m" if pelne else
+                                    f"{ile[bk]} z {k * k} wycinków" +
+                                    ("" if ile[bk] == k * k else " (są puste pola)"))},
+            "geometry": {"type": "Polygon", "coordinates": [ring + [ring[0]]]},
         })
+    return features
+
+
+def mapa_siatki(pozycje, wybrany, plik_poz=None, k=1, pelne=False):
+    """Satelitarna mapa z kwadratami = wycinki 256x256 w ich prawdziwym położeniu.
+    Dla k > 1 kwadraty są złączone w bloki k x k (jeden klik = jeden blok)."""
+    features, lons, lats = [], [], []
+    for i, rogi in enumerate(pozycje["rogi"]):
+        if rogi:
+            lons += [p[0] for p in rogi]
+            lats += [p[1] for p in rogi]
+
+    wyb_bk = None
+    pola, aliasy = ["idx"], ["Wycinek:"]
+    u = _uklad_siatki(plik_poz, os.path.getmtime(plik_poz)) if (plik_poz and k > 1) else None
+    if u:
+        features = _bloki_geojson(pozycje, u[1], k, pelne)
+        if wybrany in u[1]:
+            c, r = u[1][wybrany]
+            wyb_bk = [c // k, r // k]
+        pola, aliasy = ["opis"], ["Blok:"]
+    else:
+        for i, rogi in enumerate(pozycje["rogi"]):
+            if rogi:
+                features.append({
+                    "type": "Feature",
+                    "properties": {"idx": i},
+                    "geometry": {"type": "Polygon", "coordinates": [rogi + [rogi[0]]]},
+                })
 
     m = folium.Map(
         location=[(min(lats) + max(lats)) / 2, (min(lons) + max(lons)) / 2],
@@ -394,10 +631,13 @@ def mapa_siatki(pozycje, wybrany):
     m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
 
     def styl(f):
-        wyb = f["properties"]["idx"] == wybrany
+        pr = f["properties"]
+        wyb = (pr.get("bk") == wyb_bk) if "bk" in pr else (pr["idx"] == wybrany)
+        niepelny = pr.get("pelny") is False
         return {
             "color": ALERT if wyb else "white",
             "weight": 3 if wyb else 1,
+            "dashArray": "6 6" if (niepelny and not wyb) else None,
             "fillColor": ALERT if wyb else WATER,
             "fillOpacity": 0.45 if wyb else 0.08,
         }
@@ -406,7 +646,7 @@ def mapa_siatki(pozycje, wybrany):
         {"type": "FeatureCollection", "features": features},
         style_function=styl,
         highlight_function=lambda f: {"weight": 3, "fillColor": WATER, "fillOpacity": 0.35},
-        tooltip=folium.GeoJsonTooltip(fields=["idx"], aliases=["Wycinek:"]),
+        tooltip=folium.GeoJsonTooltip(fields=pola, aliases=aliasy),
     ).add_to(m)
     return m
 
@@ -432,7 +672,7 @@ if st.session_state.wybrane_miasto is None:
     with col_map:
         map_data = st_folium(
             zbuduj_mape_polski(),
-            height=640,
+            height=600,
             use_container_width=True,
             key=f"mapa_{st.session_state.map_key}",
             returned_objects=["last_object_clicked_tooltip"],
@@ -447,12 +687,14 @@ if st.session_state.wybrane_miasto is None:
         st.markdown("#### Miasta")
         for nazwa, d in MIASTA.items():
             badge = '<span class="badge">dane treningowe</span>' if d.get("trening") else ""
-            st.markdown(
-                f'<div class="city-card"><h3>{nazwa}{badge}</h3><p>{d["opis"]}</p></div>',
-                unsafe_allow_html=True,
-            )
-            if st.button(f"Analizuj: {nazwa}", key=f"btn_{nazwa}", use_container_width=True):
-                wybierz(nazwa)
+            with st.container(border=True):
+                st.markdown(
+                    f'<div class="city-card"><h3>{nazwa}{badge}</h3><p>{d["opis"]}</p></div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button(f"Analizuj: {nazwa}", key=f"btn_{nazwa}", use_container_width=True,
+                             type="primary"):
+                    wybierz(nazwa)
 
 # ==========================================
 # 5. WIDOK 2 - DASHBOARD MIASTA
@@ -524,16 +766,27 @@ else:
         if widok == "Położenie":
             pozycje = wczytaj_pozycje(npy_path) if (npy_path and n > 1) else None
             if pozycje and pozycje.get("n") == n:
-                st.caption(
-                    f"Kliknij kwadrat na mapie ({sum(1 for r in pozycje['rogi'] if r)} wycinków "
-                    "256×256 px), aby przejść do detekcji budynków."
-                )
+                plik_poz = sciezka_pozycji(npy_path)
+                blok_ok = bool(_uklad_siatki(plik_poz, os.path.getmtime(plik_poz)))
+                k = wybor_bloku(wybrane, "blok_poz", "Rozmiar obszaru (liczba wycinków)") if blok_ok else 1
+                bok_m = k * pozycje.get("patch_px", 256) * pozycje.get("res_m", 0.5)
+                ile_w = sum(1 for r in pozycje["rogi"] if r)
+                pelne = bool(blok_ok and raster_pelny_ok(npy_path, pozycje))
+                if k > 1 and pelne:
+                    st.caption(f"Bloki {k} × {k} wycinków (ok. {bok_m:.0f} × {bok_m:.0f} m), bez luk. "
+                               "Kliknij blok, aby przejść do detekcji budynków.")
+                elif k > 1:
+                    st.caption(f"{ile_w} wycinków 256×256 px złączonych w bloki {k} × {k} "
+                               f"(ok. {bok_m:.0f} × {bok_m:.0f} m każdy). Kliknij blok, aby przejść do detekcji budynków.")
+                else:
+                    st.caption(f"Kliknij kwadrat na mapie ({ile_w} wycinków 256×256 px, "
+                               f"ok. {bok_m:.0f} × {bok_m:.0f} m), aby przejść do detekcji budynków.")
                 st.session_state.setdefault(ver_key, 0)
                 map_data = st_folium(
-                    mapa_siatki(pozycje, idx),
+                    mapa_siatki(pozycje, idx, plik_poz if blok_ok else None, k, pelne),
                     height=560,
                     use_container_width=True,
-                    key=f"siatka_{wybrane}_{st.session_state[ver_key]}",
+                    key=f"siatka_{wybrane}_{st.session_state[ver_key]}_{k}",
                     returned_objects=["last_active_drawing"],
                 )
                 klik = (map_data or {}).get("last_active_drawing")
@@ -580,16 +833,39 @@ else:
             if idx is None:
                 st.info("Wybierz kwadrat w widoku „Położenie”.")
             else:
+                poz = wczytaj_pozycje(npy_path) if n > 1 else None
+                plik_poz = sciezka_pozycji(npy_path)
+                blok_ok = bool(poz and poz.get("n") == n and os.path.exists(plik_poz)
+                               and _uklad_siatki(plik_poz, os.path.getmtime(plik_poz)))
+                k = 1
+                if blok_ok:
+                    k = wybor_bloku(wybrane, "blok_det", "Rozmiar obszaru (liczba wycinków)")
                 if n > 1:
-                    st.caption(f"Wybrany wycinek: {idx} z {n - 1} (256×256 px)")
+                    bok_m = k * poz.get("patch_px", 256) * poz.get("res_m", 0.5) if poz else None
+                    opis_m = f", obszar ok. {bok_m:.0f} × {bok_m:.0f} m" if bok_m else ""
+                    st.caption(f"Wybrany wycinek: {idx} z {n - 1} (256×256 px){opis_m}"
+                               if k == 1 else
+                               f"Blok {k} × {k} wycinków (zawiera wycinek {idx}){opis_m}")
                 else:
                     st.caption("Plik zawiera jeden raster terenu (bez podziału na wycinki).")
                 with st.spinner("Model przetwarza dane NMT…"):
-                    data, mask = run_segmentation(npy_path, idx)
+                    if k == 1:
+                        data, mask = run_segmentation(npy_path, idx)
+                    elif raster_pelny_ok(npy_path, poz):
+                        data, mask = run_segmentation_raster(npy_path, idx, k, plik_poz)
+                        brakuje = 0
+                    else:
+                        ind = indeksy_bloku(plik_poz, idx, k)
+                        data, mask = run_segmentation_blok(npy_path, ind, k)
+                        brakuje = sum(1 for j in ind if j is None)
+                        if brakuje:
+                            st.caption(f"W tym bloku nie ma {brakuje} z {k * k} wycinków. W danych nie ma tych "
+                                       "kwadratów (szare pola na wykresach), więc detekcja ich nie obejmuje.")
 
                 H, W = mask.shape
                 px_budynki = int(mask.sum())
-                pokrycie = 100 * px_budynki / mask.size
+                wazne = int(np.isfinite(data).sum()) if k > 1 else mask.size
+                pokrycie = 100 * px_budynki / max(wazne, 1)
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Wykryte piksele zabudowy", f"{px_budynki:,}".replace(",", " "))
@@ -604,7 +880,12 @@ else:
                 ax[0].set_title("Model terenu (NMT)", fontsize=13, color=INK, pad=10)
                 fig.colorbar(im, ax=ax[0], fraction=0.046, pad=0.02)
 
-                ax[1].imshow(mask, cmap=ListedColormap([MIST, INK]))
+                brak_px = np.isnan(data) if k > 1 else None
+                maska_pokaz = np.ma.masked_where(brak_px, mask) if k > 1 else mask
+                if k > 1:
+                    for a_ in ax:
+                        a_.set_facecolor("#C9D6DC")      # szare pola = brak wycinka (brak danych)
+                ax[1].imshow(maska_pokaz, cmap=ListedColormap([MIST, INK]))
                 ax[1].set_title("Maska budynków (U-Net)", fontsize=13, color=INK, pad=10)
 
                 ax[2].imshow(data, cmap="gray")
@@ -627,8 +908,6 @@ else:
                                  key=f"gif_{wybrane}")
             else:
                 rzeka = next(iter(gify))
-            if idx is not None and n > 1 and idx != d["patch"]:
-                st.caption(f"Symulacja dotyczy wycinka {d['patch']}, a nie wybranego {idx}.")
             _, mid, _ = st.columns([1, 4, 1])
             with mid:
                 st.image(

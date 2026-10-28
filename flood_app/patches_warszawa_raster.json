@@ -1,0 +1,1 @@
+{"plik_tif": "NMPT_WARSZAWA_CALOSC.tif", "crs": "EPSG:2180", "transform": [0.5, 0.0, 636422.75, 0.0, -0.5, 491550.25], "patch_px": 256, "res_m": 0.5, "wysokosc_px": 19200, "szerokosc_px": 17664, "siatka": [75, 69], "p2": 77.33999633789062, "p98": 131.41000366210938, "skala": 65535}

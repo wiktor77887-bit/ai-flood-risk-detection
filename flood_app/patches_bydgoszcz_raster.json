@@ -1,0 +1,1 @@
+{"plik_tif": "NMPT_BYDGOSZCZ_CALOSC.tif", "crs": "EPSG:2180", "transform": [0.5, 0.0, 430947.25, 0.0, -0.5, 587223.25], "patch_px": 256, "res_m": 0.5, "wysokosc_px": 14080, "szerokosc_px": 12800, "siatka": [55, 50], "p2": 37.11000061035156, "p98": 94.45999908447266, "skala": 65535}

@@ -1,0 +1,1 @@
+{"plik_tif": "NMPT_POZNAN_CALOSC.tif", "crs": "EPSG:2180", "transform": [0.5, 0.0, 357517.75, 0.0, -0.5, 510017.75], "patch_px": 256, "res_m": 0.5, "wysokosc_px": 14336, "szerokosc_px": 13312, "siatka": [56, 52], "p2": 53.400001525878906, "p98": 101.0, "skala": 65535}

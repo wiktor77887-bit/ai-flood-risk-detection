@@ -1,0 +1,18 @@
+# środowisko i pliki generowane
+venv/
+__pycache__/
+*.pyc
+nohup.out
+*.log
+*.bak
+
+# SEKRETY: nigdy do repozytorium (hash hasła logowania)
+.streamlit/secrets.toml
+
+# duże pliki danych i model (trzymaj je tylko na serwerze lub w Git LFS)
+*.pth
+*.npy
+*.gif
+*.tif
+*.tiff
+*.asc
